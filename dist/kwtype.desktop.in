@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Exec=@prefix@/bin/@executable@
+Terminal=false
+Name=KWtype
+GenericName=Virtual Keyboard Input
+Comment=Trigger synthetic keyboard events
+Categories=Qt;KDE;Utility;
+X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input
+NoDisplay=true
