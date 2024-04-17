@@ -16,7 +16,7 @@ kwaylandclient = dependency('KWaylandClient')
 xkbcommon = dependency('xkbcommon')
 
 includes = include_directories('/usr/include/KWayland')
-qtprocessed = qt6.preprocess(moc_headers: 'src/main.h')
+qtprocessed = qt6.compile_moc(headers: 'src/main.h')
 
 prefix = get_option('prefix')
 conf_data = configuration_data()
