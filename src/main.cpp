@@ -10,6 +10,9 @@
 #include <QTimer>
 
 #include <linux/input-event-codes.h>
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusReply>
 
 KWtype::KWtype(QObject *parent)
     : QObject(parent)
@@ -109,11 +112,31 @@ void KWtype::sendKey(quint32 keyCode)
     }
 }
 
+static uint32_t kwinGetLayout()
+{
+    auto msg = QDBusMessage::createMethodCall(
+        "org.kde.keyboard", "/Layouts",
+        "org.kde.KeyboardLayouts", "getLayout");
+    QDBusReply<uint> reply = QDBusConnection::sessionBus().call(msg);
+    return reply.isValid() ? reply.value() : 0;
+}
+
+static void kwinSetLayout(uint32_t idx)
+{
+    auto msg = QDBusMessage::createMethodCall(
+        "org.kde.keyboard", "/Layouts",
+        "org.kde.KeyboardLayouts", "setLayout");
+    msg << static_cast<uint>(idx);
+    QDBusConnection::sessionBus().call(msg);
+}
+
 int KWtype::handleText(const QStringList& text)
 {
     auto ret = 0;
     auto xkb = Xkb::self();
     auto stringFinalIdx = text.size() - 1;
+    uint32_t originalLayout = kwinGetLayout();
+    uint32_t currentLayout = originalLayout;
 
     for (auto string = text.begin(); string != text.end(); ++string) {
         auto stringIdx = std::distance(text.begin(), string);
@@ -123,7 +146,6 @@ int KWtype::handleText(const QStringList& text)
         for (auto chp = ucs4String.begin(); chp != ucs4String.end(); ++chp) {
             auto chIdx = std::distance(ucs4String.begin(), chp);
             auto ch = *chp;
-            // std::cout << "Character: 0x" << std::format("{:X}", ch) << "\n";
             xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
             if (keysym == XKB_KEY_NoSymbol) {
                 std::cerr << "Failed to convert character '0x" << std::format("{:X}", ch) << "' to keysym\n";
@@ -147,6 +169,19 @@ int KWtype::handleText(const QStringList& text)
                 }
                 sendKey(KEY_SPACE);
                 continue;
+            }
+
+            // Switch layout via KWin DBus if needed
+            uint32_t targetLayout = keycode->layout;
+            if (currentLayout != targetLayout) {
+                kwinSetLayout(targetLayout);
+                // Wait until KWin confirms the layout change
+                for (int i = 0; i < 50; i++) {
+                    sleep(5);
+                    if (kwinGetLayout() == targetLayout) break;
+                }
+                sleep(20);
+                currentLayout = targetLayout;
             }
 
             switch (keycode->level) {
@@ -179,6 +214,11 @@ int KWtype::handleText(const QStringList& text)
                 sleep(keyDelay);
             }
         }
+    }
+
+    // Restore original layout
+    if (currentLayout != originalLayout) {
+        kwinSetLayout(originalLayout);
     }
 
     return ret;
