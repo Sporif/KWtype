@@ -2,6 +2,8 @@
 #include "xkb.h"
 
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <chrono>
 #include <thread>
 
@@ -132,6 +134,22 @@ static void kwinSetLayout(uint32_t idx)
     QDBusConnection::sessionBus().call(msg);
 }
 
+static bool isCapsLockActive()
+{
+    namespace fs = std::filesystem;
+    try {
+        for (const auto &entry : fs::directory_iterator("/sys/class/leds/")) {
+            if (entry.path().filename().string().find("capslock") != std::string::npos) {
+                std::ifstream brightness(entry.path() / "brightness");
+                int val = 0;
+                if (brightness >> val)
+                    return val > 0;
+            }
+        }
+    } catch (...) {}
+    return false;
+}
+
 int KWtype::handleText(const QStringList& text)
 {
     auto ret = 0;
@@ -144,6 +162,13 @@ int KWtype::handleText(const QStringList& text)
     }
     uint32_t originalLayout = kwinGetLayout();
     uint32_t currentLayout = originalLayout;
+
+    // Disable Caps Lock if active to prevent inverted case
+    bool capsLockWasActive = isCapsLockActive();
+    if (capsLockWasActive) {
+        sendKey(KEY_CAPSLOCK);
+        sleep(20);
+    }
 
     for (auto string = text.begin(); string != text.end(); ++string) {
         auto stringIdx = std::distance(text.begin(), string);
@@ -244,6 +269,11 @@ int KWtype::handleText(const QStringList& text)
         wl_display_roundtrip_queue(m_connectionThreadObject->display(),
                                    *m_eventQueue);
         kwinSetLayout(originalLayout);
+    }
+
+    // Restore Caps Lock if it was originally active
+    if (capsLockWasActive) {
+        sendKey(KEY_CAPSLOCK);
     }
 
     return ret;
