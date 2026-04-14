@@ -10,6 +10,11 @@
 #include <QTimer>
 
 #include <linux/input-event-codes.h>
+#include <wayland-client.h>
+#include <QDBusConnection>
+#include <QDBusConnectionInterface>
+#include <QDBusMessage>
+#include <QDBusReply>
 
 KWtype::KWtype(QObject *parent)
     : QObject(parent)
@@ -109,11 +114,36 @@ void KWtype::sendKey(quint32 keyCode)
     }
 }
 
+static uint32_t kwinGetLayout()
+{
+    auto msg = QDBusMessage::createMethodCall(
+        "org.kde.keyboard", "/Layouts",
+        "org.kde.KeyboardLayouts", "getLayout");
+    QDBusReply<uint> reply = QDBusConnection::sessionBus().call(msg);
+    return reply.isValid() ? reply.value() : 0;
+}
+
+static void kwinSetLayout(uint32_t idx)
+{
+    auto msg = QDBusMessage::createMethodCall(
+        "org.kde.keyboard", "/Layouts",
+        "org.kde.KeyboardLayouts", "setLayout");
+    msg << static_cast<uint>(idx);
+    QDBusConnection::sessionBus().call(msg);
+}
+
 int KWtype::handleText(const QStringList& text)
 {
     auto ret = 0;
     auto xkb = Xkb::self();
     auto stringFinalIdx = text.size() - 1;
+    if (!QDBusConnection::sessionBus().interface()->isServiceRegistered(
+            "org.kde.keyboard")) {
+        std::cerr << "Error: org.kde.keyboard DBus service is not available.\n";
+        return 1;
+    }
+    uint32_t originalLayout = kwinGetLayout();
+    uint32_t currentLayout = originalLayout;
 
     for (auto string = text.begin(); string != text.end(); ++string) {
         auto stringIdx = std::distance(text.begin(), string);
@@ -123,7 +153,6 @@ int KWtype::handleText(const QStringList& text)
         for (auto chp = ucs4String.begin(); chp != ucs4String.end(); ++chp) {
             auto chIdx = std::distance(ucs4String.begin(), chp);
             auto ch = *chp;
-            // std::cout << "Character: 0x" << std::format("{:X}", ch) << "\n";
             xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
             if (keysym == XKB_KEY_NoSymbol) {
                 std::cerr << "Failed to convert character '0x" << std::format("{:X}", ch) << "' to keysym\n";
@@ -131,7 +160,7 @@ int KWtype::handleText(const QStringList& text)
                 continue;
             }
 
-            auto keycode = xkb->keycodeFromKeysym(keysym);
+            auto keycode = xkb->keycodeFromKeysym(keysym, currentLayout);
             if (!keycode) {
                 // Type using CTRL+SHIFT+U <UNICODE HEX>
                 keyPress(KEY_LEFTCTRL);
@@ -142,11 +171,40 @@ int KWtype::handleText(const QStringList& text)
                 std::string ch_hex = std::format("{:x}", ch);
                 for(char& ch : ch_hex) {
                     xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
-                    auto keycode = xkb->keycodeFromKeysym(keysym);
+                    auto keycode = xkb->keycodeFromKeysym(keysym, currentLayout);
                     sendKey(keycode->code);
                 }
                 sendKey(KEY_SPACE);
                 continue;
+            }
+
+            // Switch layout via KWin DBus if needed
+            uint32_t targetLayout = keycode->layout;
+            if (currentLayout != targetLayout) {
+                // Wayland roundtrip: ensure the compositor has processed all
+                // pending FakeInput key events before switching the layout.
+                // FakeInput travels via the Wayland socket while setLayout
+                // uses DBus — without this sync the compositor may apply
+                // the layout change before the previous key event.
+                wl_display_roundtrip_queue(m_connectionThreadObject->display(),
+                                           *m_eventQueue);
+                kwinSetLayout(targetLayout);
+                // Wait until KWin confirms the layout change
+                bool switched = false;
+                for (int i = 0; i < 50; i++) {
+                    sleep(5);
+                    if (kwinGetLayout() == targetLayout) {
+                        switched = true;
+                        break;
+                    }
+                }
+                if (!switched) {
+                    std::cerr << "Warning: KWin did not confirm layout switch to "
+                              << targetLayout << " within timeout; "
+                              "subsequent characters may be typed incorrectly\n";
+                }
+                sleep(20);
+                currentLayout = targetLayout;
             }
 
             switch (keycode->level) {
@@ -179,6 +237,13 @@ int KWtype::handleText(const QStringList& text)
                 sleep(keyDelay);
             }
         }
+    }
+
+    // Restore original layout
+    if (currentLayout != originalLayout) {
+        wl_display_roundtrip_queue(m_connectionThreadObject->display(),
+                                   *m_eventQueue);
+        kwinSetLayout(originalLayout);
     }
 
     return ret;
