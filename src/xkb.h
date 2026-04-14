@@ -6,6 +6,7 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace
 {
@@ -38,24 +39,31 @@ public:
     struct Code {
         const uint32_t level;
         const uint32_t code;
+        const uint32_t layout;
     };
-    std::optional<Code> keycodeFromKeysym(xkb_keysym_t keysym)
+    std::optional<Code> keycodeFromKeysym(xkb_keysym_t keysym, uint32_t preferredLayout = 0)
     {
         // The offset between KEY_* numbering, and keycodes in the XKB evdev dataset.
         static const uint EVDEV_OFFSET = 8;
 
-        auto layout = xkb_state_serialize_layout(m_state.get(), XKB_STATE_LAYOUT_EFFECTIVE);
-        // auto layout_name = xkb_keymap_layout_get_name(m_keymap.get(), layout);
-        // std::cout << "layout: " << layout_name << "\n";
+        auto num_layouts = xkb_keymap_num_layouts(m_keymap.get());
         const xkb_keycode_t max = xkb_keymap_max_keycode(m_keymap.get());
-        for (xkb_keycode_t keycode = xkb_keymap_min_keycode(m_keymap.get()); keycode < max; keycode++) {
-            uint levelCount = xkb_keymap_num_levels_for_key(m_keymap.get(), keycode, layout);
-            for (uint currentLevel = 0; currentLevel < levelCount; currentLevel++) {
-                const xkb_keysym_t *syms;
-                uint num_syms = xkb_keymap_key_get_syms_by_level(m_keymap.get(), keycode, layout, currentLevel, &syms);
-                for (uint sym = 0; sym < num_syms; sym++) {
-                    if (syms[sym] == keysym) {
-                        return Code{currentLevel, keycode - EVDEV_OFFSET};
+
+        // Search the preferred (current) layout first to minimize layout switches.
+        // Characters common to multiple layouts (e.g. ASCII letters) will be found
+        // on the current layout, avoiding an unnecessary switch and the race condition
+        // between FakeInput (Wayland) and setLayout (DBus).
+        for (uint32_t i = 0; i < num_layouts; i++) {
+            uint32_t layout = (preferredLayout + i) % num_layouts;
+            for (xkb_keycode_t keycode = xkb_keymap_min_keycode(m_keymap.get()); keycode < max; keycode++) {
+                uint levelCount = xkb_keymap_num_levels_for_key(m_keymap.get(), keycode, layout);
+                for (uint currentLevel = 0; currentLevel < levelCount; currentLevel++) {
+                    const xkb_keysym_t *syms;
+                    uint num_syms = xkb_keymap_key_get_syms_by_level(m_keymap.get(), keycode, layout, currentLevel, &syms);
+                    for (uint sym = 0; sym < num_syms; sym++) {
+                        if (syms[sym] == keysym) {
+                            return Code{currentLevel, keycode - EVDEV_OFFSET, layout};
+                        }
                     }
                 }
             }

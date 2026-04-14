@@ -11,8 +11,9 @@ project(
 project_name = meson.project_name().to_lower()
 
 qt6 = import('qt6')
-qt6_deps = dependency('qt6', modules: ['Core'])
+qt6_deps = dependency('qt6', modules: ['Core', 'DBus'])
 kwaylandclient = dependency('KWaylandClient')
+wayland_client = dependency('wayland-client')
 xkbcommon = dependency('xkbcommon')
 
 qtprocessed = qt6.compile_moc(headers: 'src/main.h')
@@ -38,6 +39,7 @@ executable(
     dependencies: [
         qt6_deps,
         kwaylandclient,
+        wayland_client,
         xkbcommon,
     ],
     install : true,
