@@ -5,7 +5,10 @@
 #include <fstream>
 #include <filesystem>
 #include <chrono>
+#include <optional>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 
 #include <QCoreApplication>
 #include <QCommandLineParser>
@@ -150,6 +153,43 @@ static bool isCapsLockActive()
     return false;
 }
 
+// Map Unicode combining marks (from NFD decomposition) to the corresponding
+// XKB dead keysyms, so characters like ê or Ç can be composed through a dead
+// key when the keymap has no direct keycode for the precomposed character.
+static const std::unordered_map<uint32_t, xkb_keysym_t> combiningToDeadKeysym = {
+    {0x0300, XKB_KEY_dead_grave},
+    {0x0301, XKB_KEY_dead_acute},
+    {0x0302, XKB_KEY_dead_circumflex},
+    {0x0303, XKB_KEY_dead_tilde},
+    {0x0304, XKB_KEY_dead_macron},
+    {0x0306, XKB_KEY_dead_breve},
+    {0x0307, XKB_KEY_dead_abovedot},
+    {0x0308, XKB_KEY_dead_diaeresis},
+    {0x030A, XKB_KEY_dead_abovering},
+    {0x030B, XKB_KEY_dead_doubleacute},
+    {0x030C, XKB_KEY_dead_caron},
+    {0x0327, XKB_KEY_dead_cedilla},
+    {0x0328, XKB_KEY_dead_ogonek},
+};
+
+// Decompose a character into (dead keysym, base keysym) if it can be written
+// as base + combining mark, e.g. ê -> (dead_circumflex, e).
+static std::optional<std::pair<xkb_keysym_t, xkb_keysym_t>> deadKeyDecompose(uint ch)
+{
+    const char32_t ucs4 = ch;
+    const QString nfd = QString::fromUcs4(&ucs4, 1).normalized(QString::NormalizationForm_D);
+    const auto parts = nfd.toUcs4();
+    if (parts.size() != 2)
+        return {};
+    const auto it = combiningToDeadKeysym.find(parts[1]);
+    if (it == combiningToDeadKeysym.end())
+        return {};
+    const xkb_keysym_t base = xkb_utf32_to_keysym(parts[0]);
+    if (base == XKB_KEY_NoSymbol)
+        return {};
+    return std::make_pair(it->second, base);
+}
+
 int KWtype::handleText(const QStringList& text)
 {
     auto ret = 0;
@@ -170,6 +210,81 @@ int KWtype::handleText(const QStringList& text)
         sleep(20);
     }
 
+    // Switch layout via KWin DBus if needed, then press the key with the
+    // modifiers required for its shift level.
+    auto typeCode = [&](const Xkb::Code &keycode) {
+        uint32_t targetLayout = keycode.layout;
+        if (currentLayout != targetLayout) {
+            // Wayland roundtrip: ensure the compositor has processed all
+            // pending FakeInput key events before switching the layout.
+            // FakeInput travels via the Wayland socket while setLayout
+            // uses DBus — without this sync the compositor may apply
+            // the layout change before the previous key event.
+            wl_display_roundtrip_queue(m_connectionThreadObject->display(),
+                                       *m_eventQueue);
+            kwinSetLayout(targetLayout);
+            // Wait until KWin confirms the layout change
+            bool switched = false;
+            for (int i = 0; i < 50; i++) {
+                sleep(5);
+                if (kwinGetLayout() == targetLayout) {
+                    switched = true;
+                    break;
+                }
+            }
+            if (!switched) {
+                std::cerr << "Warning: KWin did not confirm layout switch to "
+                          << targetLayout << " within timeout; "
+                          "subsequent characters may be typed incorrectly\n";
+            }
+            sleep(20);
+            currentLayout = targetLayout;
+        }
+
+        switch (keycode.level) {
+        case 0:
+            sendKey(keycode.code);
+            break;
+        case 1:
+            keyPress(KEY_LEFTSHIFT);
+            sendKey(keycode.code);
+            keyRelease(KEY_LEFTSHIFT);
+            break;
+        case 2:
+            keyPress(KEY_RIGHTALT);
+            sendKey(keycode.code);
+            keyRelease(KEY_RIGHTALT);
+            break;
+        case 3:
+            keyPress(KEY_LEFTSHIFT);
+            keyPress(KEY_RIGHTALT);
+            sendKey(keycode.code);
+            keyRelease(KEY_LEFTSHIFT);
+            keyRelease(KEY_RIGHTALT);
+            break;
+        default:
+            std::cerr << "Unsupported key level: " << (keycode.level + 1) << ", key code: " << keycode.code << "\n";
+            ret = 2;
+            break;
+        }
+    };
+
+    // Type using CTRL+SHIFT+U <UNICODE HEX> (IBus-style unicode input)
+    auto typeUnicodeHex = [&](uint ch) {
+        keyPress(KEY_LEFTCTRL);
+        keyPress(KEY_LEFTSHIFT);
+        sendKey(KEY_U);
+        keyRelease(KEY_LEFTCTRL);
+        keyRelease(KEY_LEFTSHIFT);
+        std::string ch_hex = std::format("{:x}", ch);
+        for(char& ch : ch_hex) {
+            xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
+            auto keycode = xkb->keycodeFromKeysym(keysym, currentLayout);
+            sendKey(keycode->code);
+        }
+        sendKey(KEY_SPACE);
+    };
+
     for (auto string = text.begin(); string != text.end(); ++string) {
         auto stringIdx = std::distance(text.begin(), string);
         QVector<uint> ucs4String = string->toUcs4();
@@ -186,77 +301,28 @@ int KWtype::handleText(const QStringList& text)
             }
 
             auto keycode = xkb->keycodeFromKeysym(keysym, currentLayout);
-            if (!keycode) {
-                // Type using CTRL+SHIFT+U <UNICODE HEX>
-                keyPress(KEY_LEFTCTRL);
-                keyPress(KEY_LEFTSHIFT);
-                sendKey(KEY_U);
-                keyRelease(KEY_LEFTCTRL);
-                keyRelease(KEY_LEFTSHIFT);
-                std::string ch_hex = std::format("{:x}", ch);
-                for(char& ch : ch_hex) {
-                    xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
-                    auto keycode = xkb->keycodeFromKeysym(keysym, currentLayout);
-                    sendKey(keycode->code);
-                }
-                sendKey(KEY_SPACE);
-                continue;
-            }
-
-            // Switch layout via KWin DBus if needed
-            uint32_t targetLayout = keycode->layout;
-            if (currentLayout != targetLayout) {
-                // Wayland roundtrip: ensure the compositor has processed all
-                // pending FakeInput key events before switching the layout.
-                // FakeInput travels via the Wayland socket while setLayout
-                // uses DBus — without this sync the compositor may apply
-                // the layout change before the previous key event.
-                wl_display_roundtrip_queue(m_connectionThreadObject->display(),
-                                           *m_eventQueue);
-                kwinSetLayout(targetLayout);
-                // Wait until KWin confirms the layout change
-                bool switched = false;
-                for (int i = 0; i < 50; i++) {
-                    sleep(5);
-                    if (kwinGetLayout() == targetLayout) {
-                        switched = true;
-                        break;
+            if (keycode) {
+                typeCode(*keycode);
+            } else {
+                // No direct keycode for this character. Many layouts (French,
+                // French Canadian, Portuguese, ...) only provide accented
+                // letters through dead keys, so try composing the character
+                // from a dead key + base key before falling back to
+                // CTRL+SHIFT+U, which only works in applications with
+                // IBus-style unicode input (not terminals or Qt apps).
+                bool composed = false;
+                if (auto deadSeq = deadKeyDecompose(ch)) {
+                    auto dead = xkb->keycodeFromKeysym(deadSeq->first, currentLayout);
+                    auto base = xkb->keycodeFromKeysym(deadSeq->second, currentLayout);
+                    if (dead && base) {
+                        typeCode(*dead);
+                        typeCode(*base);
+                        composed = true;
                     }
                 }
-                if (!switched) {
-                    std::cerr << "Warning: KWin did not confirm layout switch to "
-                              << targetLayout << " within timeout; "
-                              "subsequent characters may be typed incorrectly\n";
+                if (!composed) {
+                    typeUnicodeHex(ch);
                 }
-                sleep(20);
-                currentLayout = targetLayout;
-            }
-
-            switch (keycode->level) {
-            case 0:
-                sendKey(keycode->code);
-                break;
-            case 1:
-                keyPress(KEY_LEFTSHIFT);
-                sendKey(keycode->code);
-                keyRelease(KEY_LEFTSHIFT);
-                break;
-            case 2:
-                keyPress(KEY_RIGHTALT);
-                sendKey(keycode->code);
-                keyRelease(KEY_RIGHTALT);
-                break;
-            case 3:
-                keyPress(KEY_LEFTSHIFT);
-                keyPress(KEY_RIGHTALT);
-                sendKey(keycode->code);
-                keyRelease(KEY_LEFTSHIFT);
-                keyRelease(KEY_RIGHTALT);
-                break;
-            default:
-                std::cerr << "Unsupported key level: " << (keycode->level + 1) << ", key code: " << keycode->code << "\n";
-                ret = 2;
-                break;
             }
             if (keyDelay != 0 && (stringIdx != stringFinalIdx || chIdx != chFinalIdx)) {
                 sleep(keyDelay);
