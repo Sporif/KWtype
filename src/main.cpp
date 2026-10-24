@@ -5,10 +5,12 @@
 #include <fstream>
 #include <filesystem>
 #include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include <QCoreApplication>
 #include <QCommandLineParser>
+#include <QFile>
 #include <QTimer>
 
 #include <linux/input-event-codes.h>
@@ -294,6 +296,9 @@ int main(int argc, char **argv)
     parser.setApplicationDescription("Virtual keyboard input tool for KDE Wayland");
     parser.addHelpOption();
     parser.addVersionOption();
+    QCommandLineOption stdinOpt(QStringList() << "s" << "stdin",
+            QCoreApplication::translate("main", "Read UTF-8 text from standard input until EOF instead of positional text"));
+    parser.addOption(stdinOpt);
     QCommandLineOption noFlushOpt(QStringList() << "no-flush",
             QCoreApplication::translate("main", "Do not flush the wayland connection after each key press/release"));
     parser.addOption(noFlushOpt);
@@ -305,8 +310,27 @@ int main(int argc, char **argv)
             QCoreApplication::translate("main", "Hold each key for N milliseconds (the delay between key press and release)"),
             QCoreApplication::translate("main", "hold"));
     parser.addOption(keyHoldOpt);
-    parser.addPositionalArgument("text", QCoreApplication::translate("main", "Text to type"));
+    parser.addPositionalArgument("text", QCoreApplication::translate("main", "Text to type"), "[text...]");
     parser.process(app);
+
+    QStringList text = parser.positionalArguments();
+    if (parser.isSet(stdinOpt)) {
+        if (!text.isEmpty()) {
+            std::cerr << "Error: --stdin cannot be combined with positional text.\n";
+            return 1;
+        }
+        QFile input;
+        if (!input.open(stdin, QIODevice::ReadOnly)) {
+            std::cerr << "Error: failed to open standard input: " << input.errorString().toStdString() << "\n";
+            return 1;
+        }
+        const QByteArray data = input.readAll();
+        if (input.error() != QFileDevice::NoError) {
+            std::cerr << "Error: failed to read standard input: " << input.errorString().toStdString() << "\n";
+            return 1;
+        }
+        text.append(QString::fromUtf8(data));
+    }
 
     KWtype wtype(&app);
     if (parser.isSet(noFlushOpt)) {
@@ -320,7 +344,6 @@ int main(int argc, char **argv)
         QString keyHoldStr = parser.value(keyHoldOpt);
         wtype.keyHold = keyHoldStr.toUInt();
     }
-    const QStringList text = parser.positionalArguments();
 
     QTimer timer;
     timer.setSingleShot(true);
