@@ -96,11 +96,17 @@ void KWtype::setupRegistry()
 void KWtype::keyPress(quint32 keyCode)
 {
     m_fakeInput->requestKeyboardKeyPress(keyCode);
+    if (!noFlush) {
+        m_connectionThreadObject->flush();
+    }
 }
 
 void KWtype::keyRelease(quint32 keyCode)
 {
     m_fakeInput->requestKeyboardKeyRelease(keyCode);
+    if (!noFlush) {
+        m_connectionThreadObject->flush();
+    }
 }
 
 void KWtype::sendKey(quint32 keyCode)
@@ -190,9 +196,12 @@ int KWtype::handleText(const QStringList& text)
                 // Type using CTRL+SHIFT+U <UNICODE HEX>
                 keyPress(KEY_LEFTCTRL);
                 keyPress(KEY_LEFTSHIFT);
+                sleep(15);
                 sendKey(KEY_U);
+                sleep(15);
                 keyRelease(KEY_LEFTCTRL);
                 keyRelease(KEY_LEFTSHIFT);
+                sleep(5);
                 std::string ch_hex = std::format("{:x}", ch);
                 for(char& ch : ch_hex) {
                     xkb_keysym_t keysym = xkb_utf32_to_keysym(ch);
@@ -237,21 +246,33 @@ int KWtype::handleText(const QStringList& text)
                 sendKey(keycode->code);
                 break;
             case 1:
+                // Modifier press/release must be flushed and given time to be
+                // processed by the compositor before the key event, otherwise
+                // the shift state can race and produce inverted case.
                 keyPress(KEY_LEFTSHIFT);
+                sleep(15);
                 sendKey(keycode->code);
+                sleep(15);
                 keyRelease(KEY_LEFTSHIFT);
+                sleep(5);
                 break;
             case 2:
                 keyPress(KEY_RIGHTALT);
+                sleep(15);
                 sendKey(keycode->code);
+                sleep(15);
                 keyRelease(KEY_RIGHTALT);
+                sleep(5);
                 break;
             case 3:
                 keyPress(KEY_LEFTSHIFT);
                 keyPress(KEY_RIGHTALT);
+                sleep(15);
                 sendKey(keycode->code);
+                sleep(15);
                 keyRelease(KEY_LEFTSHIFT);
                 keyRelease(KEY_RIGHTALT);
+                sleep(5);
                 break;
             default:
                 std::cerr << "Unsupported key level: " << (keycode->level + 1) << ", key code: " << keycode->code << "\n";
